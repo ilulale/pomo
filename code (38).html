@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Dot Matrix Pomodoro</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+    <style>
+        :root { --screen-bg: #111; --font-family: 'VT323', monospace; }
+        html, body {
+            margin: 0; padding: 0; width: 100vw; height: 100vh;
+            overflow: hidden; background-color: var(--screen-bg);
+            -webkit-user-select: none; -moz-user-select: none; -ms-user-select: none;
+            user-select: none; -webkit-touch-callout: none; cursor: pointer;
+            touch-action: none;
+        }
+        #display-canvas { width: 100%; height: 100%; display: block; }
+        #instructions {
+            position: fixed; bottom: 3vmin; left: 50%; transform: translateX(-50%);
+            color: rgba(255, 255, 255, 0.4); font-family: var(--font-family);
+            font-size: clamp(12px, 2.5vmin, 20px); pointer-events: none;
+            opacity: 1; transition: opacity 0.5s ease-out 2s;
+        }
+        #instructions.hidden { opacity: 0; transition-delay: 0s; }
+        #text-canvas { display: none; }
+    </style>
+</head>
+<body>
+    <canvas id="display-canvas"></canvas>
+    <div id="instructions">
+        PAUSED: Swipe on digits to set time &nbsp;|&nbsp; TAP: Start/Pause &nbsp;|&nbsp; DBL-TAP: Skip &nbsp;|&nbsp; HOLD: Reset
+    </div>
+    <canvas id="text-canvas"></canvas>
+
+    <!-- SHADERS -->
+    <script id="vertex-shader" type="x-shader/x-vertex">
+        attribute vec4 a_position; varying vec2 v_texCoord;
+        void main() { gl_Position = a_position; v_texCoord = vec2(a_position.x*0.5+0.5, a_position.y*-0.5+0.5); }
+    </script>
+    <script id="fragment-shader" type="x-shader/x-fragment">
+        precision highp float;
+        uniform sampler2D u_texture; uniform vec2 u_resolution; uniform float u_pixel_size;
+        uniform float u_time; uniform float u_brightness; uniform float u_glitch;
+        varying vec2 v_texCoord;
+        float rand(vec2 co){ return fract(sin(dot(co.xy, vec2(12.9898,78.233))) * 43758.5453); }
+        void main() {
+            vec2 uv = v_texCoord;
+            if (u_glitch > 0.0) {
+                float glitchAmount = u_glitch * 0.1;
+                uv.x += (rand(uv + u_time) - 0.5) * glitchAmount;
+                uv.y += (rand(uv + u_time * 0.5) - 0.5) * glitchAmount;
+            }
+            vec2 grid_uv = floor(uv * u_resolution / u_pixel_size) * u_pixel_size / u_resolution;
+            vec2 center_uv = grid_uv + (u_pixel_size / u_resolution / 2.0);
+            vec4 texColor = texture2D(u_texture, center_uv);
+            if (texColor.r<0.01&&texColor.g<0.01&&texColor.b<0.01) { gl_FragColor=vec4(0.,0.,0.,1.); return; }
+            float dist = distance(uv * u_resolution, center_uv * u_resolution) / u_pixel_size;
+            float intensity = 1.0 - smoothstep(0.4, 0.5, dist);
+            float glow = smoothstep(0.5, 1.0, dist);
+            vec3 finalColor = texColor.rgb * intensity + texColor.rgb * (1.0 - glow) * 0.5;
+            float scanline = sin(v_texCoord.y * 400.0 + u_time * -20.0) * 0.03;
+            finalColor -= scanline;
+            if (u_glitch > 0.0) { finalColor += rand(v_texCoord + u_time * 2.0) * u_glitch; }
+            gl_FragColor = vec4(finalColor * u_brightness, 1.0);
+        }
+    </script>
+
+    <script>
+        // --- POMODORO CONFIG & STATE ---
+        const DURATION = { WORK: 25 * 60, SHORT_BREAK: 5 * 60, LONG_BREAK: 15 * 60 };
+        const LONG_BREAK_INTERVAL = 4;
+        let mode = 'WORK', timeLeft = DURATION.WORK, pomodoroCount = 0, isRunning = false, timerInterval = null, totalDuration = DURATION.WORK;
+        let isInitialized = false;
+
+        // --- INTERACTION & ANIMATION STATE ---
+        const LONG_PRESS_DURATION = 750, DOUBLE_TAP_DELAY = 300, TAP_MOVE_THRESHOLD = 10;
+        let interactionStart = { x: 0, y: 0 };
+        let longPressTimer, wasLongPress = false, isSwiping = false, lastTapTime = 0;
+        let digitHitboxes = [], swipedDigitIndex = -1, touchStartY = 0;
+        let animations = { brightness: 0, glitch: 0, holdProgress: 0, digits: [0,0,0,0] };
+
+        // --- AUDIO ---
+        let audioContext;
+        const createAudioContext = () => { if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)(); };
+        const playSound = (freq, dur, type, vol=0.2) => {
+            if (!audioContext) return;
+            const osc = audioContext.createOscillator(), gain = audioContext.createGain();
+            osc.connect(gain); gain.connect(audioContext.destination); gain.gain.setValueAtTime(vol, audioContext.currentTime);
+            osc.type = type; osc.frequency.setValueAtTime(freq, audioContext.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + dur);
+            osc.start(audioContext.currentTime); osc.stop(audioContext.currentTime + dur);
+        };
+        const playClick = (on) => playSound(on ? 880 : 780, 0.1, 'triangle', 0.1);
+        const playSkip = () => { playSound(600, 0.1, 'sine'); setTimeout(() => playSound(900, 0.1, 'sine'), 80); };
+        const playTick = () => playSound(1200, 0.05, 'square', 0.05);
+        const playCountdownBeep = (time) => playSound(440 + (5 - time) * 110, 0.1, 'sine', 0.3);
+        const playEndChime = () => { playSound(150, 0.8, 'sawtooth', 0.4); };
+        const playBootSound = () => { playSound(50, 0.3, 'sawtooth', 0.1); setTimeout(() => playSound(440, 0.1, 'sine', 0.2), 150); };
+        
+        // --- WEBGL & CANVAS SETUP ---
+        const webglCanvas = document.getElementById('display-canvas'), gl = webglCanvas.getContext('webgl', { antialias: true });
+        const textCanvas = document.getElementById('text-canvas'), ctx = textCanvas.getContext('2d');
+        const instructions = document.getElementById('instructions');
+        const FONT = "VT323", COLORS = { work: '#ff3860', break: '#32ff7e', dim: '#3a3a3a' };
+        
+        // WEBGL Init (condensed)
+        function createShader(gl,type,source){const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);return s}
+        const vs=createShader(gl,gl.VERTEX_SHADER,document.getElementById('vertex-shader').text),fs=createShader(gl,gl.FRAGMENT_SHADER,document.getElementById('fragment-shader').text),p=gl.createProgram();
+        gl.attachShader(p,vs);gl.attachShader(p,fs);gl.linkProgram(p);gl.useProgram(p);
+        const pb=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,pb);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+        const pl=gl.getAttribLocation(p,"a_position");gl.enableVertexAttribArray(pl);gl.vertexAttribPointer(pl,2,gl.FLOAT,false,0,0);
+        const tx=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tx);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+        const tl=gl.getUniformLocation(p,"u_texture");gl.uniform1i(tl,0);const rl=gl.getUniformLocation(p,"u_resolution");const psl=gl.getUniformLocation(p,"u_pixel_size");
+        const b_uniform=gl.getUniformLocation(p,"u_brightness"), t_uniform=gl.getUniformLocation(p,"u_time"), g_uniform=gl.getUniformLocation(p,"u_glitch");
+
+        // --- UI DRAWING & LAYOUT ---
+        function roundRect(ctx, x, y, width, height, radius) {
+            ctx.beginPath(); ctx.moveTo(x + radius, y);
+            ctx.lineTo(x + width - radius, y); ctx.arcTo(x + width, y, x + width, y + radius, radius);
+            ctx.lineTo(x + width, y + height - radius); ctx.arcTo(x + width, y + height, x + width - radius, y + height, radius);
+            ctx.lineTo(x + radius, y + height); ctx.arcTo(x, y + height, x, y + height - radius, radius);
+            ctx.lineTo(x, y + radius); ctx.arcTo(x, y, x + radius, y, radius);
+            ctx.closePath();
+        }
+
+        // NEW: Helper function for drawing bold text
+        function drawBoldText(ctx, text, x, y) {
+            const dpr = window.devicePixelRatio || 1;
+            const offset = 1.5 * dpr;
+            ctx.fillText(text, x - offset, y);
+            ctx.fillText(text, x + offset, y);
+            ctx.fillText(text, x, y - offset);
+            ctx.fillText(text, x, y + offset);
+        }
+
+        function drawOnTextCanvas() {
+            const w = textCanvas.width, h = textCanvas.height;
+            ctx.clearRect(0, 0, w, h); ctx.fillStyle = '#000'; ctx.fillRect(0, 0, w, h);
+            
+            let mainColor = (mode==='WORK') ? COLORS.work : COLORS.break;
+            let contentBrightness = 1;
+            if(animations.holdProgress > 0) contentBrightness = 1 - animations.holdProgress * 0.7;
+            ctx.globalAlpha = contentBrightness;
+            if(longPressTimer && Date.now() % 100 < 50) ctx.globalAlpha *= 0.8;
+
+            const isLandscape = w > h;
+            const mainPadding = Math.min(w, h) * 0.05;
+            const cornerRadius = mainPadding * 0.8;
+            const borderWidth = mainPadding * 0.3;
+
+            ctx.save();
+            roundRect(ctx, mainPadding, mainPadding, w - mainPadding * 2, h - mainPadding * 2, cornerRadius);
+            ctx.clip();
+            
+            // --- DRAW LAYOUT BASED ON ORIENTATION ---
+            if (isLandscape) {
+                // LANDSCAPE LAYOUT
+                const midX = w * 0.5;
+                const progress = totalDuration > 0 ? timeLeft / totalDuration : 1;
+                const fillHeight = (h - mainPadding*2) * progress;
+                const fillY = mainPadding + (h - mainPadding*2) - fillHeight;
+                
+                ctx.fillStyle = COLORS.dim; ctx.fillRect(mainPadding, mainPadding, midX - mainPadding, h - mainPadding*2);
+                ctx.fillStyle = mainColor; ctx.fillRect(mainPadding, fillY, midX - mainPadding, fillHeight);
+                ctx.globalCompositeOperation = 'destination-out';
+                ctx.font = `${h * 0.4}px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                drawBoldText(ctx, (mode==='WORK')?'FOCUS':'BREAK', (midX + mainPadding)/2, h/2);
+                ctx.globalCompositeOperation = 'source-over';
+                
+                ctx.fillStyle = mainColor; roundRect(ctx, midX - borderWidth, mainPadding, w - midX, h-mainPadding*2, cornerRadius); ctx.fill();
+                ctx.globalCompositeOperation = 'destination-out';
+                roundRect(ctx, midX, mainPadding+borderWidth, w-midX-mainPadding-borderWidth, h-mainPadding*2-borderWidth*2, cornerRadius-borderWidth); ctx.fill();
+                ctx.globalCompositeOperation = 'source-over';
+                
+                ctx.fillStyle = mainColor;
+                const timeStr = `${String(Math.floor(timeLeft/60)).padStart(2,'0')}:${String(timeLeft%60).padStart(2,'0')}`;
+                const timeFontSize = h * 0.5; ctx.font = `${timeFontSize}px ${FONT}`;
+                const charWidth = ctx.measureText("0").width; const timeStartX = midX + (w*0.5 - mainPadding - charWidth*5)/2;
+                digitHitboxes = [];
+                for(let i=0; i<5; i++){
+                    const char = timeStr.charAt(i); const x = timeStartX+(i*charWidth);
+                    if(char===':') { drawBoldText(ctx, char, x, h * 0.45); continue; }
+                    const digitIndex = (i < 2) ? i : i - 1;
+                    if(animations.digits[digitIndex] > 0) { drawBoldText(ctx, String(Math.floor(Math.random()*10)), x, h*0.45); }
+                    else { drawBoldText(ctx, char, x, h * 0.45); }
+                    digitHitboxes[digitIndex] = {x:x, y:h*0.45-timeFontSize/2, w:charWidth, h:timeFontSize};
+                }
+                ctx.font=`${h*0.15}px ${FONT}`; ctx.textAlign='right'; drawBoldText(ctx, 'LEFT', w - mainPadding*1.5, h - mainPadding*1.5);
+                const blocksToShow = (mode==='LONG_BREAK'&&isRunning)?LONG_BREAK_INTERVAL:pomodoroCount%LONG_BREAK_INTERVAL;
+                const barY=h-mainPadding*1.5-h*0.1, barTotalWidth=w*0.25, barBlockWidth=barTotalWidth/LONG_BREAK_INTERVAL;
+                for(let i=0;i<LONG_BREAK_INTERVAL;i++){ctx.fillStyle=i<blocksToShow?mainColor:COLORS.dim;roundRect(ctx, mainPadding*1.5+i*barBlockWidth,barY,barBlockWidth-mainPadding*0.2,h*0.1,cornerRadius*0.2);ctx.fill();}
+
+            } else {
+                // PORTRAIT LAYOUT
+                const midY = h * 0.5;
+                const progress = totalDuration > 0 ? timeLeft / totalDuration : 1;
+                const fillHeight = (midY - mainPadding) * progress;
+                const fillY = mainPadding + (midY - mainPadding) - fillHeight;
+
+                ctx.fillStyle = COLORS.dim; ctx.fillRect(mainPadding, mainPadding, w - mainPadding * 2, midY - mainPadding);
+                ctx.fillStyle = mainColor; ctx.fillRect(mainPadding, fillY, w - mainPadding * 2, fillHeight);
+                ctx.globalCompositeOperation = 'destination-out';
+                ctx.font = `${w * 0.25}px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                drawBoldText(ctx, (mode==='WORK')?'FOCUS':'BREAK', w/2, (midY + mainPadding)/2);
+                ctx.globalCompositeOperation = 'source-over';
+
+                ctx.fillStyle = mainColor; roundRect(ctx, mainPadding, midY - borderWidth, w - mainPadding * 2, h-midY, cornerRadius); ctx.fill();
+                ctx.globalCompositeOperation = 'destination-out';
+                roundRect(ctx, mainPadding+borderWidth, midY, w - mainPadding*2 - borderWidth*2, h-midY-mainPadding-borderWidth, cornerRadius-borderWidth); ctx.fill();
+                ctx.globalCompositeOperation = 'source-over';
+                
+                ctx.fillStyle = mainColor;
+                const timeStr = `${String(Math.floor(timeLeft/60)).padStart(2,'0')}:${String(timeLeft%60).padStart(2,'0')}`;
+                const timeFontSize = w * 0.3; ctx.font = `${timeFontSize}px ${FONT}`;
+                const charWidth = ctx.measureText("0").width; const timeStartX = (w - charWidth*5)/2;
+                digitHitboxes = [];
+                for(let i=0; i<5; i++){
+                    const char = timeStr.charAt(i); const x = timeStartX+(i*charWidth);
+                    if(char===':') { drawBoldText(ctx, char, x, midY + h * 0.15); continue; }
+                    const digitIndex = (i < 2) ? i : i - 1;
+                    if(animations.digits[digitIndex] > 0) { drawBoldText(ctx, String(Math.floor(Math.random()*10)), x, midY + h * 0.15); }
+                    else { drawBoldText(ctx, char, x, midY + h * 0.15); }
+                    digitHitboxes[digitIndex] = {x:x, y:midY + h * 0.15-timeFontSize/2, w:charWidth, h:timeFontSize};
+                }
+                ctx.font=`${w*0.1}px ${FONT}`; ctx.textAlign='right'; drawBoldText(ctx, 'LEFT', w-mainPadding*1.5, midY + h * 0.3);
+                const blocksToShow = (mode==='LONG_BREAK'&&isRunning)?LONG_BREAK_INTERVAL:pomodoroCount%LONG_BREAK_INTERVAL;
+                const barTotalWidth=w*0.5, barBlockWidth=barTotalWidth/LONG_BREAK_INTERVAL;
+                for(let i=0;i<LONG_BREAK_INTERVAL;i++){ctx.fillStyle=i<blocksToShow?mainColor:COLORS.dim;roundRect(ctx, mainPadding*1.5+i*barBlockWidth,h-mainPadding*1.5-w*0.05,barBlockWidth-mainPadding*0.2,w*0.05,cornerRadius*0.2);ctx.fill();}
+            }
+
+            ctx.restore();
+            ctx.globalAlpha = 1;
+        }
+        
+        // RENDER LOOP
+        let lastFrameTime = 0;
+        function render(currentTime) {
+            // ... (Identical to previous version)
+            const dt = (currentTime - lastFrameTime) / 1000 || 0; lastFrameTime = currentTime;
+            if (!isInitialized) {
+                animations.brightness += dt * 2.0; animations.glitch = 1.0 - animations.brightness;
+                if (animations.brightness >= 1) { animations.brightness = 1; animations.glitch = 0; isInitialized = true; }
+            } else {
+                animations.brightness += (1 - animations.brightness) * 0.2;
+                animations.glitch -= 1.5 * dt; if(animations.glitch < 0) animations.glitch = 0;
+                animations.digits.forEach((d,i,a) => { if(d>0) a[i] -= dt; });
+                if (longPressTimer) animations.holdProgress = (Date.now() - longPressTimer) / LONG_PRESS_DURATION;
+                else if (animations.holdProgress > 0) animations.holdProgress -= 5 * dt;
+            }
+            const dpr=window.devicePixelRatio||1,dW=webglCanvas.clientWidth,dH=webglCanvas.clientHeight;const pS=2.0;
+            if(webglCanvas.width!==dW*dpr||webglCanvas.height!==dH*dpr){webglCanvas.width=dW*dpr;webglCanvas.height=dH*dpr;textCanvas.width=dW*dpr;textCanvas.height=dH*dpr;gl.viewport(0,0,gl.canvas.width,gl.canvas.height);}
+            drawOnTextCanvas();
+            gl.bindTexture(gl.TEXTURE_2D,tx);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,textCanvas);
+            gl.uniform2f(rl,gl.canvas.width,gl.canvas.height);gl.uniform1f(psl,pS*dpr);gl.uniform1f(t_uniform,currentTime/1000);
+            const finalBrightness = animations.brightness * (1 - animations.glitch);
+            gl.uniform1f(b_uniform, finalBrightness); gl.uniform1f(g_uniform, animations.glitch);
+            gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+            requestAnimationFrame(render);
+        }
+
+        // POMODORO LOGIC
+        // ... (Identical to previous version)
+        function setTimer(newTime, newTotal) { timeLeft = newTime; totalDuration = newTotal; }
+        function switchMode(skipped = false) {
+            if(!skipped) { animations.glitch = 1.0; playEndChime(); }
+            else { playSkip(); }
+            pauseTimer(false);
+            if(mode === 'WORK'){pomodoroCount++; mode = (pomodoroCount%LONG_BREAK_INTERVAL===0)?'LONG_BREAK':'SHORT_BREAK';}
+            else {if(mode==='LONG_BREAK'&&pomodoroCount>0)pomodoroCount=0; mode='WORK';}
+            setTimer(DURATION[mode], DURATION[mode]);
+        }
+        function tick(){
+            if(timeLeft > 0) { timeLeft--;
+                if(timeLeft < 5 && timeLeft >= 0 && isRunning) { playCountdownBeep(timeLeft + 1); animations.brightness = 1.5; }
+            } else { if(isRunning) switchMode(); }
+        }
+        function startTimer(){if(isRunning)return;createAudioContext();isRunning=true;setTimer(timeLeft, timeLeft); timerInterval=setInterval(tick,1000);animations.brightness=0;playClick(true);}
+        function pauseTimer(animate = true){if(!isRunning)return;isRunning=false;clearInterval(timerInterval);if(animate){animations.brightness=0;playClick(false);}}
+        function resetApp(){pauseTimer(false);mode='WORK';setTimer(DURATION.WORK, DURATION.WORK);pomodoroCount=0;playEndChime();animations.glitch=1.0;}
+        function updateTime(digitIndex, direction){
+            let change = (digitIndex <= 1) ? 60 * direction : 1 * direction; let newTime = timeLeft + change;
+            newTime=Math.max(0,Math.min(5999,newTime));
+            setTimer(newTime, newTime); DURATION[mode]=newTime; animations.digits[digitIndex]=0.15; playTick();
+        }
+
+        // INTERACTION HANDLERS
+        // ... (Identical to previous version)
+        function handleInteractionStart(e) {
+            if (!isInitialized) return;
+            instructions.classList.add('hidden'); const dpr = window.devicePixelRatio || 1;
+            interactionStart.x = (e.touches ? e.touches[0].clientX : e.clientX);
+            interactionStart.y = (e.touches ? e.touches[0].clientY : e.clientY);
+            wasLongPress = false; isSwiping = false; swipedDigitIndex = -1;
+            if (!isRunning) {
+                const canvasX = interactionStart.x * dpr, canvasY = interactionStart.y * dpr;
+                digitHitboxes.forEach((box, i) => {
+                    if (canvasX > box.x && canvasX < box.x+box.w && canvasY > box.y && canvasY < box.y+box.h) {
+                        swipedDigitIndex = i; touchStartY = interactionStart.y;
+                    }
+                });
+            }
+            if (swipedDigitIndex === -1) { longPressTimer = setTimeout(() => { wasLongPress = true; resetApp(); longPressTimer = null; }, LONG_PRESS_DURATION); }
+        }
+        function handleInteractionMove(e) {
+            if (!isInitialized) return;
+            const currentX = (e.touches ? e.touches[0].clientX : e.clientX);
+            const currentY = (e.touches ? e.touches[0].clientY : e.clientY);
+            const dist = Math.sqrt(Math.pow(currentX - interactionStart.x, 2) + Math.pow(currentY - interactionStart.y, 2));
+            if (dist > TAP_MOVE_THRESHOLD) { isSwiping = true; if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } }
+            if (isSwiping && swipedDigitIndex !== -1 && !isRunning) { e.preventDefault(); const deltaY = touchStartY - currentY; if (Math.abs(deltaY) > TAP_MOVE_THRESHOLD * 1.5) { updateTime(swipedDigitIndex, Math.sign(deltaY)); touchStartY = currentY; } }
+        }
+        function handleInteractionEnd(e) {
+            if (!isInitialized) return;
+            if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+            animations.holdProgress = 0; if (wasLongPress || isSwiping) return;
+            const currentTime = Date.now();
+            if (currentTime - lastTapTime < DOUBLE_TAP_DELAY) { switchMode(true); lastTapTime = 0; } 
+            else { isRunning ? pauseTimer() : startTimer(); lastTapTime = currentTime; }
+        }
+        
+        // INITIALIZE
+        document.body.addEventListener('pointerdown', handleInteractionStart);
+        document.body.addEventListener('pointermove', handleInteractionMove);
+        document.body.addEventListener('pointerup', handleInteractionEnd);
+        document.body.addEventListener('pointercancel', handleInteractionEnd);
+        document.fonts.ready.then(() => {
+            playBootSound();
+            requestAnimationFrame(render);
+        });
+    </script>
+</body>
+</html>
